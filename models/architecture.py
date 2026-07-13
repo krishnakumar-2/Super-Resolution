@@ -1,111 +1,84 @@
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-class LiftedEncoder(nn.Module):
-    def __init__(self, in_channels=2, latent_channels=64, target_res=64):
-        super().__init__()
-        self.target_res = target_res
+def velocity_from_vorticity(omega):
+    B, _, H, W = omega.shape
+    w = omega[:, 0].float()
+    kx = torch.fft.fftfreq(H, d=1.0).view(1, H, 1).to(w.device) * 2 * torch.pi
+    ky = (
+        torch.fft.rfftfreq(W, d=1.0).view(1, 1, -1).to(w.device) * 2 * torch.pi
+    )
+    k2 = (kx**2 + ky**2).clone()
+    k2[..., 0, 0] = 1.0
+    w_ft = torch.fft.rfft2(w)
+    psi_ft = w_ft / k2
+    u = torch.fft.irfft2(1j * ky * psi_ft, s=(H, W))
+    v = torch.fft.irfft2(-1j * kx * psi_ft, s=(H, W))
+    return torch.stack([u, v], dim=-1)
 
-        self.lift = nn.Sequential(
-            nn.Conv2d(in_channels, latent_channels, kernel_size=3, padding=1, padding_mode='circular'),
+
+class ResBlock(nn.Module):
+    def __init__(self, c):
+        super().__init__()
+        self.body = nn.Sequential(
+            nn.Conv2d(c, c, 3, padding=1, padding_mode="circular"),
             nn.GELU(),
-            nn.Conv2d(latent_channels, latent_channels, kernel_size=3, padding=1, padding_mode='circular'),
-            nn.GELU(),
+            nn.Conv2d(c, c, 3, padding=1, padding_mode="circular"),
         )
 
     def forward(self, x):
-        z = self.lift(x)
-        z = F.interpolate(z, size=(self.target_res, self.target_res), mode='bicubic', align_corners=False)
-        return z
+        return x + self.body(x)
 
 
-class SpectralTransportBlock(nn.Module):
-    def __init__(self, channels):
+class VortSR(nn.Module):
+    def __init__(self, hr_res=128, channels=64, n_blocks=8, lr_res=32):
         super().__init__()
-
-        self.radial_mlp = nn.Sequential(
-            nn.Linear(1, 32),
-            nn.GELU(),
-            nn.Linear(32, 32),
-            nn.GELU(),
-            nn.Linear(32, 1),
-            nn.Softplus(),
+        assert hr_res % lr_res == 0, "hr_res must be a multiple of lr_res"
+        self.hr_res = hr_res
+        self.head = nn.Conv2d(
+            1, channels, 3, padding=1, padding_mode="circular"
+        )
+        self.body = nn.Sequential(
+            *[ResBlock(channels) for _ in range(n_blocks)]
         )
 
-        self.weight = nn.Parameter(
-            torch.randn(channels, channels, dtype=torch.cfloat) * 0.02
+        up, s = [], hr_res // lr_res
+        while s > 1:
+            f = 2 if s % 2 == 0 else s
+            up += [
+                nn.Conv2d(
+                    channels,
+                    channels * f * f,
+                    3,
+                    padding=1,
+                    padding_mode="circular",
+                ),
+                nn.PixelShuffle(f),
+            ]
+            s //= f
+        self.upsample = nn.Sequential(*up)
+
+        self.tail = nn.Conv2d(
+            channels, 1, 3, padding=1, padding_mode="circular"
         )
+        nn.init.zeros_(self.tail.weight)
+        nn.init.zeros_(self.tail.bias)
 
-        self.residual = nn.Sequential(
-            nn.Conv2d(channels, channels, kernel_size=3, padding=1, padding_mode='circular'),
-            nn.GELU(),
-            nn.Conv2d(channels, channels, kernel_size=1),
+    def forward(self, lr):
+        up = F.interpolate(
+            lr,
+            size=(self.hr_res, self.hr_res),
+            mode="bicubic",
+            align_corners=False,
         )
-
-    def forward(self, x):
-        B, C, H, W = x.shape
-
-        x_ft = torch.fft.rfft2(x)
-        _, _, Hf, Wf = x_ft.shape
-
-        freq_x = torch.fft.fftfreq(H, d=1.0).to(x.device)
-        freq_y = torch.fft.rfftfreq(W, d=1.0).to(x.device)
-        KX, KY = torch.meshgrid(freq_x, freq_y, indexing='ij')
-        k_rad = torch.sqrt(KX ** 2 + KY ** 2)
-
-        k_max = k_rad.max().clamp(min=1e-8)
-        k_norm = (k_rad / k_max).unsqueeze(-1)
-
-        gain = self.radial_mlp(k_norm).squeeze(-1)
-        gain = gain.unsqueeze(0).unsqueeze(0)
-
-        x_ft_mod = x_ft * gain
-        x_ft_mixed = torch.einsum('bchw,dc->bdhw', x_ft_mod, self.weight)
-        x_spectral = torch.fft.irfft2(x_ft_mixed, s=(H, W))
-
-        return x_spectral + self.residual(x)
-
-
-class DeRhamProjectionHead(nn.Module):
-    def __init__(self, in_channels):
-        super().__init__()
-        self.to_stream = nn.Conv2d(in_channels, 1, kernel_size=1)
-
-    def forward(self, z):
-        B, C, H, W = z.shape
-
-        psi = self.to_stream(z).squeeze(1)
-        psi_ft = torch.fft.rfft2(psi)
-
-        kx = torch.fft.fftfreq(H, d=1.0).to(z.device)
-        ky = torch.fft.rfftfreq(W, d=1.0).to(z.device)
-        KX, KY = torch.meshgrid(kx, ky, indexing='ij')
-
-        u_ft = (2j * torch.pi * KY.unsqueeze(0)) * psi_ft
-        v_ft = (-2j * torch.pi * KX.unsqueeze(0)) * psi_ft
-
-        u = torch.fft.irfft2(u_ft, s=(H, W))
-        v = torch.fft.irfft2(v_ft, s=(H, W))
-
-        return torch.stack([u, v], dim=-1)
-
-
-class DR_STO(nn.Module):
-    def __init__(self, in_channels=2, latent_channels=64, lr_res=16, hr_res=64):
-        super().__init__()
-        self.encoder  = LiftedEncoder(in_channels, latent_channels, hr_res)
-        self.sotb     = SpectralTransportBlock(latent_channels)
-        self.dec_head = DeRhamProjectionHead(latent_channels)
-
-    def forward(self, x):
-        z   = self.encoder(x)
-        z   = self.sotb(z)
-        out = self.dec_head(z)
-        return out
+        z = self.head(lr)
+        z = self.body(z)
+        z = self.upsample(z)
+        omega = up + self.tail(z)
+        vel = velocity_from_vorticity(omega)
+        return omega, vel
 
     def count_parameters(self):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
-
