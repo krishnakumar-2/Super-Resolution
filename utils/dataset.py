@@ -1,174 +1,138 @@
 import os
-import logging
-import numpy as np
+import glob
+import random
 import torch
-import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-import scipy.io
-import h5py
 
-log = logging.getLogger(__name__)
+SCALE = 4
 
 
-def spectral_coarsen(u_hr, lr_res):
-    B, C, H, W = u_hr.shape
-    assert H == W
-
-    u_ft = torch.fft.rfft2(u_hr)
-
-    kmax = lr_res // 2
-    u_ft_trunc = torch.zeros(B, C, lr_res, kmax + 1,
-                             dtype=u_ft.dtype, device=u_ft.device)
-
-    u_ft_trunc[:, :, :kmax, :] = u_ft[:, :, :kmax, :kmax + 1]
-    u_ft_trunc[:, :, kmax:, :] = u_ft[:, :, H - kmax:, :kmax + 1]
-
-    scale = (lr_res / H) ** 2
-    u_lr = torch.fft.irfft2(u_ft_trunc, s=(lr_res, lr_res)) * scale
-
-    return u_lr
+def _find(path):
+    if os.path.isdir(path):
+        h = sorted(glob.glob(os.path.join(path, "**", "*.pt"), recursive=True))
+        if not h:
+            raise FileNotFoundError(path)
+        return h[0]
+    return path
 
 
-def vorticity_to_velocity(w):
-    B, H, W = w.shape
-    w_ft = torch.fft.fft2(w)
-
-    kx = torch.fft.fftfreq(H, d=1.0 / H).to(w.device)
-    ky = torch.fft.fftfreq(W, d=1.0 / W).to(w.device)
-    KX, KY = torch.meshgrid(kx, ky, indexing='ij')
-
-    k2 = KX ** 2 + KY ** 2
-    k2[0, 0] = 1.0
-
-    psi_ft = -w_ft / (4.0 * np.pi ** 2 * k2.unsqueeze(0))
-    psi_ft[:, 0, 0] = 0.0
-
-    u_ft = 2j * np.pi * KY.unsqueeze(0) * psi_ft
-    v_ft = -2j * np.pi * KX.unsqueeze(0) * psi_ft
-
-    u = torch.fft.ifft2(u_ft).real
-    v = torch.fft.ifft2(v_ft).real
-    return torch.stack([u, v], dim=-1)
+def _load(path):
+    raw = torch.load(_find(path), map_location="cpu")
+    if isinstance(raw, dict):
+        raw = next(iter(raw.values()))
+    d = torch.as_tensor(raw).float()
+    return d
 
 
-def generate_synthetic_turbulence(n, res, seed=42):
-    rng = np.random.default_rng(seed)
-    x = torch.linspace(0, 2 * np.pi, res + 1)[:-1]
-    y = torch.linspace(0, 2 * np.pi, res + 1)[:-1]
-    X, Y = torch.meshgrid(x, y, indexing='ij')
-
-    fields = []
-    for _ in range(n):
-        phases = rng.uniform(0, 2 * np.pi, 8)
-        amps   = rng.uniform(0.3, 1.0, 4)
-        psi = (amps[0] * torch.sin(3 * X + phases[0]) * torch.cos(4 * Y + phases[1])
-             + amps[1] * torch.sin(8 * X + phases[2]) * torch.cos(7 * Y + phases[3])
-             + amps[2] * torch.sin(5 * X + phases[4]) * torch.cos(2 * Y + phases[5])
-             + amps[3] * torch.sin(2 * X + phases[6]) * torch.cos(9 * Y + phases[7]))
-
-        psi_ft = torch.fft.fft2(psi.unsqueeze(0))
-        kx = torch.fft.fftfreq(res, d=1.0 / res)
-        ky = torch.fft.fftfreq(res, d=1.0 / res)
-        KX, KY = torch.meshgrid(kx, ky, indexing='ij')
-        u_ft = 2j * np.pi / (2 * np.pi) * KY.unsqueeze(0) * psi_ft
-        v_ft = -2j * np.pi / (2 * np.pi) * KX.unsqueeze(0) * psi_ft
-        u = torch.fft.ifft2(u_ft).real.squeeze(0)
-        v = torch.fft.ifft2(v_ft).real.squeeze(0)
-        fields.append(torch.stack([u, v], dim=-1))
-
-    return torch.stack(fields)
+def _to_videos_uv(d):
+    if d.dim() == 5:
+        if d.shape[1] in (2, 3):
+            d = d.permute(0, 2, 3, 4, 1)
+        elif d.shape[2] in (2, 3):
+            d = d.permute(0, 1, 3, 4, 2)
+        d = d.reshape(-1, d.shape[2], d.shape[3], d.shape[4])
+    elif d.dim() == 4:
+        if d.shape[1] in (2, 3):
+            d = d.permute(0, 2, 3, 1)
+    return d[..., :2].contiguous()
 
 
-class NavierStokesDataset(Dataset):
-    def __init__(self, u_hr, mean, std, lr_res=16):
-        self.mean   = mean
-        self.std    = std
-        self.lr_res = lr_res
+def _center(uv):
+    u, v = uv[..., 0], uv[..., 1]
+    u = 0.5 * (u + torch.roll(u, 1, dims=-2))
+    v = 0.5 * (v + torch.roll(v, 1, dims=-1))
+    return u, v
 
-        u_hr_norm = (u_hr - mean) / (std + 1e-8)
 
-        u_hr_bchw = u_hr_norm.permute(0, 3, 1, 2).contiguous()
-        u_lr_bchw = spectral_coarsen(u_hr_bchw, lr_res)
+def _vorticity(uv, chunk=1024):
+    out = []
+    for i in range(0, uv.shape[0], chunk):
+        u, v = _center(uv[i : i + chunk])
+        H, W = u.shape[-2], u.shape[-1]
+        kx = torch.fft.fftfreq(H, d=1.0).view(1, H, 1) * 2 * torch.pi
+        ky = torch.fft.rfftfreq(W, d=1.0).view(1, 1, -1) * 2 * torch.pi
+        w_ft = 1j * kx * torch.fft.rfft2(v) - 1j * ky * torch.fft.rfft2(u)
+        out.append(torch.fft.irfft2(w_ft, s=(H, W)))
+    return torch.cat(out, dim=0)
 
-        self.u_hr = u_hr_norm
-        self.u_lr = u_lr_bchw
+
+def _downsample(w, out, chunk=1024):
+    if w.shape[0] > chunk:
+        return torch.cat(
+            [
+                _downsample(w[i : i + chunk], out, chunk)
+                for i in range(0, w.shape[0], chunk)
+            ],
+            dim=0,
+        )
+    N, H, W = w.shape
+    f = torch.fft.fftshift(torch.fft.fft2(w), dim=(-2, -1))
+    c, half = H // 2, out // 2
+    f = f[:, c - half : c + half, c - half : c + half]
+    f = torch.fft.ifftshift(f, dim=(-2, -1))
+    return (torch.fft.ifft2(f).real * (out * out) / (H * W)).contiguous()
+
+
+class VortDataset(Dataset):
+    def __init__(self, w_hr, w_lr, length, mean, std, train):
+        self.hr = w_hr
+        self.lr = w_lr
+        self.length = length
+        self.mean = mean
+        self.std = std
+        self.train = train
+        self.N = w_hr.shape[0]
 
     def __len__(self):
-        return len(self.u_hr)
+        return self.length
 
-    def __getitem__(self, idx):
-        return self.u_lr[idx], self.u_hr[idx]
-
-
-def load_raw_dataset(file_path):
-    if not os.path.exists(file_path):
-        log.warning("Dataset file not found. Using synthetic turbulence (debug only).")
-        return generate_synthetic_turbulence(500, 64)
-
-    log.info(f"Loading dataset: {file_path}")
-
-    try:
-        mat = scipy.io.loadmat(file_path)
-        key = 'u' if 'u' in mat else 'a'
-        raw = np.array(mat[key], dtype=np.float32)
-        if raw.ndim == 4:
-            raw = raw.transpose(3, 2, 0, 1)
-        data = torch.from_numpy(raw)
-
-    except NotImplementedError:
-        log.info("HDF5 (MATLAB v7.3) format detected.")
-        with h5py.File(file_path, 'r') as f:
-            key = 'u' if 'u' in f else 'a'
-            raw = np.array(f[key], dtype=np.float32)
-        if raw.ndim == 4:
-            raw = raw.transpose(0, 1, 3, 2)
-        data = torch.from_numpy(raw)
-
-    log.info(f"Raw tensor shape: {tuple(data.shape)}")
-
-    N, T, H, W = data.shape
-    w_last = data[:, -1, :, :]
-
-    log.info(f"Computing velocity from vorticity for {N} samples ...")
-    batch  = 256
-    u_list = []
-    for i in range(0, N, batch):
-        u_list.append(vorticity_to_velocity(w_last[i:i+batch]))
-    u_hr = torch.cat(u_list, dim=0)
-
-    log.info(f"Velocity tensor shape: {tuple(u_hr.shape)}")
-    return u_hr
+    def __getitem__(self, i):
+        rng = random if self.train else random.Random(i)
+        idx = rng.randrange(self.N)
+        hr = (self.hr[idx] - self.mean) / self.std
+        lr = (self.lr[idx] - self.mean) / self.std
+        return lr.unsqueeze(0), hr.unsqueeze(0)
 
 
-def build_dataloaders(file_path, lr_res=16, batch_size=32,
-                      n_train=4000, n_val=500, n_test=500):
-    u_hr  = load_raw_dataset(file_path)
-    total = len(u_hr)
+def build_dataloaders(file_path, lr_res, batch_size, n_train, n_val, n_test):
+    uv = _to_videos_uv(_load(file_path))
+    cap = n_train + n_val + n_test
+    if uv.shape[0] > cap:
+        sel = torch.linspace(0, uv.shape[0] - 1, cap).long()
+        uv = uv[sel]
+    w = _vorticity(uv)
+    n = w.shape[0]
+    a, b = int(0.8 * n), int(0.9 * n)
+    tr, va, te = w[:a], w[a:b], w[b:]
+    mean, std = tr.mean(), tr.std() + 1e-8
 
-    n_train = min(n_train, total)
-    n_val   = min(n_val,   total - n_train)
-    n_test  = min(n_test,  total - n_train - n_val)
+    def prep(x):
+        return x, _downsample(x, lr_res)
 
-    u_train = u_hr[:n_train]
-    u_val   = u_hr[n_train : n_train + n_val]
-    u_test  = u_hr[n_train + n_val : n_train + n_val + n_test]
+    hr_tr, lr_tr = prep(tr)
+    hr_va, lr_va = prep(va)
+    hr_te, lr_te = prep(te)
 
-    mean = u_train.mean(dim=(0, 1, 2), keepdim=True)
-    std  = u_train.std(dim=(0, 1, 2),  keepdim=True)
+    sets = [
+        VortDataset(hr_tr, lr_tr, n_train, mean, std, True),
+        VortDataset(hr_va, lr_va, n_val, mean, std, False),
+        VortDataset(hr_te, lr_te, n_test, mean, std, False),
+    ]
 
-    log.info(f"Train: {len(u_train)} | Val: {len(u_val)} | Test: {len(u_test)}")
-    log.info(f"Normalization: mean={mean.squeeze().tolist()}, std={std.squeeze().tolist()}")
+    def ld(ds, sh):
+        return DataLoader(
+            ds,
+            batch_size=batch_size,
+            shuffle=sh,
+            num_workers=2,
+            persistent_workers=True,
+            pin_memory=True,
+            drop_last=sh,
+        )
 
-    train_ds = NavierStokesDataset(u_train, mean, std, lr_res)
-    val_ds   = NavierStokesDataset(u_val,   mean, std, lr_res)
-    test_ds  = NavierStokesDataset(u_test,  mean, std, lr_res)
-
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
-                              num_workers=2, pin_memory=True, drop_last=True)
-    val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False,
-                              num_workers=2, pin_memory=True)
-    test_loader  = DataLoader(test_ds,  batch_size=batch_size, shuffle=False,
-                              num_workers=2, pin_memory=True)
-
-    return train_loader, val_loader, test_loader, (mean, std)
-
+    return (
+        ld(sets[0], True),
+        ld(sets[1], False),
+        ld(sets[2], False),
+        (mean, std),
+    )
