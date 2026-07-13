@@ -1,45 +1,45 @@
 import torch
 import torch.nn as nn
-import numpy as np
 
 
-def relative_l2_loss(pred, target):
-    diff = (pred - target).reshape(pred.shape[0], -1)
-    target_flat = target.reshape(target.shape[0], -1)
+def rel_l2(pred, target):
+    B = pred.shape[0]
+    d = (pred - target).reshape(B, -1)
+    t = target.reshape(B, -1)
+    return torch.mean(torch.norm(d, dim=1) / (torch.norm(t, dim=1) + 1e-8))
+
+
+def _radial_E(field):
+    f = field.permute(0, 3, 1, 2) if field.shape[-1] in (1, 2) else field
+    H, W = f.shape[-2], f.shape[-1]
+    e = (torch.fft.fft2(f.float()).abs() ** 2).mean(0).sum(0)
+    kx = torch.fft.fftfreq(H, d=1.0 / H).to(field.device)
+    ky = torch.fft.fftfreq(W, d=1.0 / W).to(field.device)
+    KX, KY = torch.meshgrid(kx, ky, indexing="ij")
+    k = torch.sqrt(KX**2 + KY**2).round().long().flatten()
+    shells = torch.zeros(int(k.max()) + 1, device=field.device)
+    shells.scatter_add_(0, k, e.flatten())
+    return shells
+
+
+def spectral_loss(pred_v, target_v):
     return torch.mean(
-        torch.norm(diff, dim=1) / (torch.norm(target_flat, dim=1) + 1e-8)
+        (
+            torch.log(_radial_E(pred_v) + 1e-8)
+            - torch.log(_radial_E(target_v) + 1e-8)
+        )
+        ** 2
     )
 
 
-def wasserstein1_spectral_loss(pred, target):
-    B, H, W, _ = pred.shape
-
-    pred_f   = pred.permute(0, 3, 1, 2)
-    target_f = target.permute(0, 3, 1, 2)
-
-    pred_psd   = torch.mean(torch.abs(torch.fft.rfft2(pred_f))   ** 2, dim=(0, 1))
-    target_psd = torch.mean(torch.abs(torch.fft.rfft2(target_f)) ** 2, dim=(0, 1))
-
-    pred_psd   = pred_psd.flatten()
-    target_psd = target_psd.flatten()
-
-    pred_psd   = pred_psd   / (pred_psd.sum()   + 1e-8)
-    target_psd = target_psd / (target_psd.sum() + 1e-8)
-
-    pred_cdf   = torch.cumsum(pred_psd,   dim=0)
-    target_cdf = torch.cumsum(target_psd, dim=0)
-
-    return torch.mean(torch.abs(pred_cdf - target_cdf))
-
-
-class DRSTOLoss(nn.Module):
-    def __init__(self, lambda_sot=0.1):
+class SRLoss(nn.Module):
+    def __init__(self, a_spec=0.1, g_vel=1.0):
         super().__init__()
-        self.lambda_sot = lambda_sot
+        self.a = a_spec
+        self.g = g_vel
 
-    def forward(self, pred, target):
-        l2_loss       = relative_l2_loss(pred, target)
-        spectral_loss = wasserstein1_spectral_loss(pred, target)
-        total         = l2_loss + self.lambda_sot * spectral_loss
-
-        return total, {'l2': l2_loss.item(), 'spectral': spectral_loss.item()}
+    def forward(self, omega, vel, v_hr):
+        lv = rel_l2(vel, v_hr)
+        ls = spectral_loss(vel, v_hr)
+        total = self.g * lv + self.a * ls
+        return total, {"v": lv.item(), "spec": ls.item()}
