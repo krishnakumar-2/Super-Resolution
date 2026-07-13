@@ -3,16 +3,18 @@ import torch
 
 
 @torch.no_grad()
-def relative_l2(pred, target):
+def relative_l2(pred: torch.Tensor, target: torch.Tensor) -> float:
     diff = (pred - target).reshape(pred.shape[0], -1)
     target_flat = target.reshape(target.shape[0], -1)
     return (
-        torch.norm(diff, dim=1) / (torch.norm(target_flat, dim=1) + 1e-8)
-    ).mean().item()
+        (torch.norm(diff, dim=1) / (torch.norm(target_flat, dim=1) + 1e-8))
+        .mean()
+        .item()
+    )
 
 
 @torch.no_grad()
-def compute_divergence(uv):
+def compute_divergence(uv: torch.Tensor) -> torch.Tensor:
     B, H, W, _ = uv.shape
     u = uv[..., 0]
     v = uv[..., 1]
@@ -22,51 +24,54 @@ def compute_divergence(uv):
 
     kx = torch.fft.fftfreq(H, d=1.0).to(uv.device)
     ky = torch.fft.rfftfreq(W, d=1.0).to(uv.device)
-    KX, KY = torch.meshgrid(kx, ky, indexing='ij')
+    KX, KY = torch.meshgrid(kx, ky, indexing="ij")
 
-    div_ft = (2j * torch.pi * KX.unsqueeze(0) * u_ft
-            + 2j * torch.pi * KY.unsqueeze(0) * v_ft)
+    div_ft = (
+        2j * torch.pi * KX.unsqueeze(0) * u_ft
+        + 2j * torch.pi * KY.unsqueeze(0) * v_ft
+    )
 
     div = torch.fft.irfft2(div_ft, s=(H, W))
     return div
 
 
 @torch.no_grad()
-def max_divergence(uv):
+def max_divergence(uv: torch.Tensor) -> float:
     div = compute_divergence(uv)
     return div.abs().max().item()
 
 
 @torch.no_grad()
-def radial_energy_spectrum(uv, n_bins=32):
+def radial_energy_spectrum(
+    uv: torch.Tensor, n_bins: int = 32
+) -> tuple[np.ndarray, np.ndarray]:
     B, H, W, _ = uv.shape
     uv_f = uv.permute(0, 3, 1, 2)
 
-    psd = 0.5 * torch.mean(
-        torch.abs(torch.fft.fft2(uv_f)) ** 2,
-        dim=(0, 1)
-    )
+    psd = 0.5 * torch.mean(torch.abs(torch.fft.fft2(uv_f)) ** 2, dim=(0, 1))
 
     kx = torch.fft.fftfreq(H, d=1.0 / H).numpy()
     ky = torch.fft.fftfreq(W, d=1.0 / W).numpy()
-    KX, KY = np.meshgrid(kx, ky, indexing='ij')
-    K = np.sqrt(KX ** 2 + KY ** 2)
+    KX, KY = np.meshgrid(kx, ky, indexing="ij")
+    K = np.sqrt(KX**2 + KY**2)
 
     psd_np = psd.cpu().numpy()
-    k_max  = K.max()
-    bins   = np.linspace(0, k_max, n_bins + 1)
+    k_max = K.max()
+    bins = np.linspace(0, k_max, n_bins + 1)
     k_bins = 0.5 * (bins[:-1] + bins[1:])
 
     E_k = np.zeros(n_bins)
     for i in range(n_bins):
-        mask   = (K >= bins[i]) & (K < bins[i + 1])
+        mask = (K >= bins[i]) & (K < bins[i + 1])
         E_k[i] = psd_np[mask].mean() if mask.any() else 0.0
 
     return k_bins, E_k
 
 
 @torch.no_grad()
-def vorticity_pdf(uv, n_bins=100):
+def vorticity_pdf(
+    uv: torch.Tensor, n_bins: int = 100
+) -> tuple[np.ndarray, np.ndarray]:
     B, H, W, _ = uv.shape
     u = uv[..., 0]
     v = uv[..., 1]
@@ -76,10 +81,12 @@ def vorticity_pdf(uv, n_bins=100):
 
     kx = torch.fft.fftfreq(H, d=1.0).to(uv.device)
     ky = torch.fft.rfftfreq(W, d=1.0).to(uv.device)
-    KX, KY = torch.meshgrid(kx, ky, indexing='ij')
+    KX, KY = torch.meshgrid(kx, ky, indexing="ij")
 
-    omega_ft = 2j * torch.pi * (KX.unsqueeze(0) * v_ft - KY.unsqueeze(0) * u_ft)
-    omega    = torch.fft.irfft2(omega_ft, s=(H, W))
+    omega_ft = (
+        2j * torch.pi * (KX.unsqueeze(0) * v_ft - KY.unsqueeze(0) * u_ft)
+    )
+    omega = torch.fft.irfft2(omega_ft, s=(H, W))
 
     omega_np = omega.cpu().numpy().flatten()
     counts, edges = np.histogram(omega_np, bins=n_bins, density=True)
@@ -88,9 +95,11 @@ def vorticity_pdf(uv, n_bins=100):
 
 
 @torch.no_grad()
-def evaluate_loader(model, loader, device, n_spectral_samples=64):
+def evaluate_loader(
+    model, loader, device, n_spectral_samples: int = 64
+) -> dict:
     model.eval()
-    all_rel_l2  = []
+    all_rel_l2 = []
     all_max_div = []
     pred_list, target_list = [], []
 
@@ -106,22 +115,22 @@ def evaluate_loader(model, loader, device, n_spectral_samples=64):
             pred_list.append(pred.cpu())
             target_list.append(u_hr.cpu())
 
-    pred_cat   = torch.cat(pred_list,   dim=0)[:n_spectral_samples]
+    pred_cat = torch.cat(pred_list, dim=0)[:n_spectral_samples]
     target_cat = torch.cat(target_list, dim=0)[:n_spectral_samples]
 
-    k_bins, E_pred    = radial_energy_spectrum(pred_cat)
-    _,      E_target  = radial_energy_spectrum(target_cat)
-    omega_bins, pdf_pred   = vorticity_pdf(pred_cat)
-    _,          pdf_target = vorticity_pdf(target_cat)
+    k_bins, E_pred = radial_energy_spectrum(pred_cat)
+    _, E_target = radial_energy_spectrum(target_cat)
+    omega_bins, pdf_pred = vorticity_pdf(pred_cat)
+    _, pdf_target = vorticity_pdf(target_cat)
 
     return {
-        'rel_l2'    : float(np.mean(all_rel_l2)),
-        'max_div'   : float(np.max(all_max_div)),
-        'mean_div'  : float(np.mean(all_max_div)),
-        'k_bins'    : k_bins,
-        'E_pred'    : E_pred,
-        'E_target'  : E_target,
-        'omega_bins': omega_bins,
-        'pdf_pred'  : pdf_pred,
-        'pdf_target': pdf_target,
+        "rel_l2": float(np.mean(all_rel_l2)),
+        "max_div": float(np.max(all_max_div)),
+        "mean_div": float(np.mean(all_max_div)),
+        "k_bins": k_bins,
+        "E_pred": E_pred,
+        "E_target": E_target,
+        "omega_bins": omega_bins,
+        "pdf_pred": pdf_pred,
+        "pdf_target": pdf_target,
     }
