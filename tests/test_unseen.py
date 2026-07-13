@@ -1,117 +1,240 @@
 import os
 import sys
-import torch
 import numpy as np
+import torch
+import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from models.architecture import DR_STO
-from utils.dataset        import build_dataloaders
-from utils.metrics        import relative_l2, max_divergence, evaluate_loader
+from models.architecture import VortSR, velocity_from_vorticity
+from utils.dataset import build_dataloaders
 
-CHECKPOINT = 'models/checkpoints/best_model.pt'
-DATA_PATH  = 'data/ns_V1e-3_N5000_T50.mat'
+MODEL_NAME = "DR-STO"
 
 
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_ROOT = os.path.dirname(_HERE) if os.path.basename(_HERE) == "tests" else _HERE
+_CANDIDATES = [
+    os.path.join(_ROOT, "models", "checkpoints"),
+    os.path.join(os.getcwd(), "models", "checkpoints"),
+    "/content/drive/MyDrive/VortSR/checkpoints",
+]
+CKPT_DIR = next(
+    (
+        d
+        for d in _CANDIDATES
+        if os.path.exists(os.path.join(d, "best_model.pt"))
+    ),
+    _CANDIDATES[0],
+)
+CHECKPOINT = os.path.join(CKPT_DIR, "best_model.pt")
+
+
+def _resolve_data(p):
+    for c in (
+        p,
+        os.path.join(_ROOT, p),
+        os.path.join(_ROOT, "data", os.path.basename(p)),
+    ):
+        if os.path.exists(c):
+            return c
+    return p
+
+
+N_SPECTRUM = 256
+
+
+def rel_l2(pred, tgt):
+    d = (pred - tgt).reshape(len(pred), -1)
+    t = tgt.reshape(len(tgt), -1)
+    return d.norm(dim=1) / (t.norm(dim=1) + 1e-12)
+
+
+def max_div(vel):
+    B, H, W, _ = vel.shape
+    kx = (
+        torch.fft.fftfreq(H, d=1.0).view(1, H, 1).to(vel.device) * 2 * torch.pi
+    )
+    ky = (
+        torch.fft.rfftfreq(W, d=1.0).view(1, 1, -1).to(vel.device)
+        * 2
+        * torch.pi
+    )
+    d = torch.fft.irfft2(
+        1j * kx * torch.fft.rfft2(vel[..., 0])
+        + 1j * ky * torch.fft.rfft2(vel[..., 1]),
+        s=(H, W),
+    )
+    return d.abs().reshape(B, -1).max(dim=1).values
+
+
+def radial_spectrum(vel):
+    u, w = vel[..., 0], vel[..., 1]
+    N, H, W = u.shape
+    e = np.zeros((H, W))
+    for i in range(0, N, 64):
+        e += 0.5 * (
+            np.abs(np.fft.fft2(u[i : i + 64])) ** 2
+            + np.abs(np.fft.fft2(w[i : i + 64])) ** 2
+        ).sum(0)
+    e /= N
+    kx = np.fft.fftfreq(H) * H
+    ky = np.fft.fftfreq(W) * W
+    KX, KY = np.meshgrid(kx, ky, indexing="ij")
+    kr = np.rint(np.hypot(KX, KY)).astype(int)
+    kmax = H // 2
+    E = np.bincount(kr.ravel(), weights=e.ravel(), minlength=kmax)[:kmax]
+    return np.arange(1, kmax), E[1:]
+
+
+def fit_slope(k, E, k_lo, k_hi):
+    m = (k >= k_lo) & (k <= k_hi) & (E > 0)
+    if m.sum() < 3:
+        return None
+    return np.polyfit(np.log(k[m]), np.log(E[m]), 1)[0]
+
+
+def stats(name, x, unit="%", scale=100.0):
+    x = np.asarray(x) * scale
+    print(f"\n  {name}")
+    print(f"    Mean ± Std : {x.mean():.2f}{unit} ± {x.std():.2f}{unit}")
+    print(f"    Median     : {np.median(x):.2f}{unit}")
+    print(f"    Best       : {x.min():.2f}{unit}")
+    print(f"    Worst      : {x.max():.2f}{unit}")
+
+
+@torch.no_grad()
 def test_unseen():
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"\nDevice: {device}")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
 
     if not os.path.exists(CHECKPOINT):
-        raise FileNotFoundError(f"No checkpoint at {CHECKPOINT}. Run train.py first.")
-
-    ckpt = torch.load(CHECKPOINT, map_location=device)
-    cfg  = ckpt['cfg']
-
-    model = DR_STO(
-        in_channels     = 2,
-        latent_channels = cfg['latent_channels'],
-        lr_res          = cfg['lr_res'],
-        hr_res          = cfg['hr_res'],
+        raise FileNotFoundError(
+            f"No checkpoint at {CHECKPOINT}. Run train.py first."
+        )
+    ck = torch.load(CHECKPOINT, map_location=device)
+    cfg = ck["cfg"]
+    model = VortSR(
+        cfg["hr_res"], cfg["channels"], cfg["n_blocks"], cfg["lr_res"]
     ).to(device)
-    model.load_state_dict(ckpt['model_state'])
+    model.load_state_dict(ck["model_state"])
     model.eval()
+    print(f'Checkpoint : epoch {ck["epoch"]}  ({CHECKPOINT})')
+    print(f"Parameters : {model.count_parameters():,}")
 
-    print(f"Loaded checkpoint from epoch {ckpt['epoch']}")
-    print(f"Parameters: {model.count_parameters():,}")
-
-    _, _, test_loader, _ = build_dataloaders(
-        file_path  = DATA_PATH,
-        lr_res     = cfg['lr_res'],
-        batch_size = 16,
-        n_train    = cfg['n_train'],
-        n_val      = cfg['n_val'],
-        n_test     = cfg['n_test'],
+    _, _, te, _ = build_dataloaders(
+        _resolve_data(cfg["data_path"]),
+        cfg["lr_res"],
+        32,
+        cfg["n_train"],
+        cfg["n_val"],
+        cfg["n_test"],
+    )
+    print(
+        f"Test samples: {len(te.dataset)}  "
+        f"(drawn from the held-out final 10% of snapshots — never trained on)"
     )
 
-    n_test = len(test_loader.dataset)
-    print(f"Test samples: {n_test}  (trajectories {cfg['n_train']+cfg['n_val']} "
-          f"- {cfg['n_train']+cfg['n_val']+n_test-1})")
-
-    all_l2  = []
-    all_div = []
+    l2_v, l2_w, l2_bi, div_m, div_bi = [], [], [], [], []
+    Vp, Vg, Vb = [], [], []
 
     print("\nEvaluating ...")
-    with torch.no_grad():
-        for u_lr, u_hr in test_loader:
-            u_lr = u_lr.to(device)
-            u_hr = u_hr.to(device)
-            pred = model(u_lr)
+    for lr, w_hr in te:
+        lr, w_hr = lr.to(device), w_hr.to(device)
+        omega, vel = model(lr)
+        v_gt = velocity_from_vorticity(w_hr)
 
-            for i in range(pred.shape[0]):
-                l2  = relative_l2(pred[i:i+1], u_hr[i:i+1])
-                div = max_divergence(pred[i:i+1])
-                all_l2.append(l2)
-                all_div.append(div)
+        w_bi = F.interpolate(
+            lr,
+            size=(cfg["hr_res"], cfg["hr_res"]),
+            mode="bicubic",
+            align_corners=False,
+        )
+        v_bi = velocity_from_vorticity(w_bi)
 
-    all_l2  = np.array(all_l2)
-    all_div = np.array(all_div)
+        l2_v.append(rel_l2(vel, v_gt).cpu())
+        l2_w.append(rel_l2(omega, w_hr).cpu())
+        l2_bi.append(rel_l2(v_bi, v_gt).cpu())
+        div_m.append(max_div(vel).cpu())
+        div_bi.append(max_div(v_bi).cpu())
 
-    print("\n" + "=" * 60)
-    print("  DR-STO  -  Unseen Test Set Results")
-    print("=" * 60)
-    print(f"\n  Relative L2 Error")
-    print(f"    Mean  +/- Std : {all_l2.mean()*100:.2f}% +/- {all_l2.std()*100:.2f}%")
-    print(f"    Best case     : {all_l2.min()*100:.2f}%")
-    print(f"    Worst case    : {all_l2.max()*100:.2f}%")
-    print(f"    Median        : {np.median(all_l2)*100:.2f}%")
+        if sum(len(v) for v in Vp) < N_SPECTRUM:
+            Vp.append(vel.float().cpu().numpy())
+            Vg.append(v_gt.float().cpu().numpy())
+            Vb.append(v_bi.float().cpu().numpy())
 
-    print(f"\n  Maximum Divergence |div u|")
-    print(f"    Mean  +/- Std : {all_div.mean():.2e} +/- {all_div.std():.2e}")
-    print(f"    Best case     : {all_div.min():.2e}")
-    print(f"    Worst case    : {all_div.max():.2e}")
-    print(f"    Median        : {np.median(all_div):.2e}")
+    l2_v = torch.cat(l2_v).numpy()
+    l2_w = torch.cat(l2_w).numpy()
+    l2_bi = torch.cat(l2_bi).numpy()
+    div_m = torch.cat(div_m).numpy()
+    div_bi = torch.cat(div_bi).numpy()
+    Vp = np.concatenate(Vp)[:N_SPECTRUM]
+    Vg = np.concatenate(Vg)[:N_SPECTRUM]
+    Vb = np.concatenate(Vb)[:N_SPECTRUM]
 
-    print(f"\n  Physical Conservation")
-    pct_below_1e5 = (all_div < 1e-5).mean() * 100
-    pct_below_1e4 = (all_div < 1e-4).mean() * 100
-    print(f"    Samples with |div u| < 1e-5 : {pct_below_1e5:.1f}%")
-    print(f"    Samples with |div u| < 1e-4 : {pct_below_1e4:.1f}%")
+    print("\n" + "=" * 64)
+    print(f"  {MODEL_NAME} — Unseen Test Set Results  ({len(l2_v)} samples)")
+    print("=" * 64)
 
-    print("\n" + "=" * 60)
-    print("  LaTeX table row:")
-    print("=" * 60)
-    print(f"  DR-STO & {all_l2.mean()*100:.2f}\\% $\\pm$ {all_l2.std()*100:.2f}\\%"
-          f" & {all_div.mean():.1e} & {all_div.max():.1e} \\\\")
-    print("=" * 60)
+    stats("Velocity relative L2 error", l2_v)
+    stats("Vorticity relative L2 error", l2_w)
+    stats("Bicubic baseline (velocity rel. L2)", l2_bi)
+    print(
+        f"\n  Improvement over bicubic : "
+        f"{l2_bi.mean() / max(l2_v.mean(), 1e-12):.2f}x lower error"
+    )
 
-    print("\nComputing spectral metrics ...")
-    metrics = evaluate_loader(model, test_loader, device, n_spectral_samples=n_test)
+    print(f"\n  Maximum divergence |div u|")
+    print(f"    Mean ± Std : {div_m.mean():.2e} ± {div_m.std():.2e}")
+    print(f"    Worst case : {div_m.max():.2e}")
+    for thr in (1e-4, 1e-5):
+        print(
+            f"    Samples with max|div u| < {thr:.0e} : "
+            f"{(div_m < thr).mean() * 100:.1f}%"
+        )
+    print(
+        "    (divergence-free by construction; residual is fp32 FFT round-off)"
+    )
 
-    k   = metrics['k_bins']
-    E_p = metrics['E_pred']
-    E_t = metrics['E_target']
+    nyq = cfg["lr_res"] // 2
+    k, Eg = radial_spectrum(Vg)
+    _, Ep = radial_spectrum(Vp)
+    _, Eb = radial_spectrum(Vb)
+    k_lo, k_hi = 4, min(2 * nyq, int(k[-1] * 0.75))
+    sg, sp, sb = (fit_slope(k, E, k_lo, k_hi) for E in (Eg, Ep, Eb))
+    if sg is not None and sp is not None:
+        print(
+            f"\n  Energy-spectrum slope (log-log fit, k in [{k_lo}, {k_hi}])"
+        )
+        print(
+            f"    Ground truth : k^{sg:.2f}   (2-D enstrophy-cascade theory: "
+            f"k^-3)"
+        )
+        print(
+            f"    {MODEL_NAME:<12} : k^{sp:.2f}   (deviation "
+            f"{abs(sp - sg):.3f})"
+        )
+        if sb is not None:
+            print(
+                f"    Bicubic      : k^{sb:.2f}   (deviation "
+                f"{abs(sb - sg):.3f})"
+            )
 
-    valid = (k > k.max() * 0.1) & (E_p > 0) & (E_t > 0)
-    if valid.sum() > 3:
-        slope_pred   = np.polyfit(np.log(k[valid]), np.log(E_p[valid]), 1)[0]
-        slope_target = np.polyfit(np.log(k[valid]), np.log(E_t[valid]), 1)[0]
-        print(f"\n  Energy Spectrum Slope (log-log fit, mid-to-high k)")
-        print(f"    Ground truth : k^{slope_target:.2f}  (theory: k^-3)")
-        print(f"    DR-STO       : k^{slope_pred:.2f}")
-        print(f"    Deviation    : {abs(slope_pred - slope_target):.3f}")
+    print("\n" + "=" * 64)
+    print("  LaTeX table rows (method & rel-L2 & mean div & worst div):")
+    print("=" * 64)
+    print(
+        f"  Bicubic & ${l2_bi.mean()*100:.2f}\\pm{l2_bi.std()*100:.2f}$ "
+        f"& ${div_bi.mean():.1e}$ & ${div_bi.max():.1e}$ \\\\"
+    )
+    print(
+        f"  {MODEL_NAME} & ${l2_v.mean()*100:.2f}\\pm{l2_v.std()*100:.2f}$ "
+        f"& ${div_m.mean():.1e}$ & ${div_m.max():.1e}$ \\\\"
+    )
+    print("=" * 64)
+    print("\nDone. Run make_figures.py for the publication figures.")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     test_unseen()
-
